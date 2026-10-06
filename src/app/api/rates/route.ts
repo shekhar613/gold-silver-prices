@@ -1,15 +1,7 @@
 import { getRates } from "@/lib/metals";
-import { isCurrency } from "@/lib/units";
-import { NextRequest } from "next/server";
 
-export async function GET(request: NextRequest) {
-  const currency = (request.nextUrl.searchParams.get("currency") ?? "USD").toUpperCase();
-  if (!isCurrency(currency)) {
-    return Response.json({ error: "That currency is not supported." }, { status: 400 });
-  }
-
-  const fresh = request.nextUrl.searchParams.get("fresh") === "1";
-  const result = await getRates(currency, { fresh });
+export async function GET() {
+  const result = await getRates();
 
   if (!result.ok) {
     return Response.json(
@@ -19,6 +11,8 @@ export async function GET(request: NextRequest) {
   }
 
   return Response.json(result.data, {
-    headers: { "Cache-Control": "private, max-age=30" },
+    headers: {
+      "Cache-Control": `private, max-age=${result.data.cacheSeconds}`,
+    },
   });
 }

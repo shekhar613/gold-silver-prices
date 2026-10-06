@@ -1,46 +1,48 @@
-import { isCurrency, type CurrencyCode } from "@/lib/units";
+import { unstable_cache } from "next/cache";
 import { connection } from "next/server";
 
 const API_BASE = "https://api.metals.dev/v1";
-const CACHE_MS = 60_000;
+const CACHE_SECONDS = 600;
+const MCX_FINENESS = 995;
+const FINE_GOLD = 999;
 
-export type HistoryPoint = {
-  date: string;
-  price: number;
+export const GOLD_CATEGORIES = [
+  { karat: "24K", fineness: 999 },
+  { karat: "22K", fineness: 916 },
+  { karat: "18K", fineness: 750 },
+  { karat: "14K", fineness: 585 },
+] as const;
+
+export type RealRate = {
+  code: string;
+  name: string;
+  pricePerGram: number;
+  detail: string;
 };
 
-export type Quote = {
-  metal: "gold" | "silver";
-  price: number;
-  ask: number;
-  bid: number;
-  high: number;
-  low: number;
-  change: number;
-  changePercent: number;
-  asOf: string;
-  history: HistoryPoint[];
+export type GoldCategory = {
+  karat: string;
+  fineness: number;
+  pricePer10g: number;
+  calculated: boolean;
 };
 
 export type RatesData = {
-  currency: CurrencyCode;
-  unit: "toz";
+  currency: "INR";
+  unit: "g";
   fetchedAt: string;
-  quotes: Quote[];
+  marketTime: string;
+  cacheSeconds: number;
+  base: "mcx" | "spot";
+  baseLabel: string;
+  realGold: RealRate[];
+  realSilver: RealRate[];
+  categories: GoldCategory[];
 };
 
 export type RatesResult =
   | { ok: true; data: RatesData }
   | { ok: false; error: string; missingKey: boolean };
-
-type CacheEntry = {
-  expires: number;
-  data: RatesData;
-};
-
-const quoteCache = new Map<CurrencyCode, CacheEntry>();
-let historyCache: { expires: number; gold: HistoryPoint[]; silver: HistoryPoint[] } | null =
-  null;
 
 class MetalsError extends Error {
   constructor(message: string) {
@@ -48,6 +50,8 @@ class MetalsError extends Error {
     this.name = "MetalsError";
   }
 }
+
+let memory: { expires: number; data: RatesData } | null = null;
 
 function readNumber(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -57,28 +61,33 @@ function readString(value: unknown) {
   return typeof value === "string" ? value : null;
 }
 
-function isoDate(date: Date) {
-  return date.toISOString().slice(0, 10);
+function per10g(pricePerGram: number) {
+  return pricePerGram * 10;
 }
 
-async function metalsGet(path: string, params: Record<string, string>) {
-  const apiKey = process.env.METALS_API_KEY?.trim();
-  if (!apiKey) {
-    throw new MetalsError("MISSING_KEY");
-  }
+function categoriesFrom(pricePerGram: number, sourceFineness: number): GoldCategory[] {
+  return GOLD_CATEGORIES.map((item) => ({
+    karat: item.karat,
+    fineness: item.fineness,
+    pricePer10g: per10g(pricePerGram * (item.fineness / sourceFineness)),
+    calculated: true,
+  }));
+}
 
-  const url = new URL(`${API_BASE}${path}`);
+async function fetchLatest(): Promise<RatesData> {
+  const apiKey = process.env.METALS_API_KEY?.trim();
+  if (!apiKey) throw new MetalsError("MISSING_KEY");
+
+  const url = new URL(`${API_BASE}/latest`);
   url.searchParams.set("api_key", apiKey);
-  for (const [key, value] of Object.entries(params)) {
-    url.searchParams.set(key, value);
-  }
+  url.searchParams.set("currency", "INR");
+  url.searchParams.set("unit", "g");
 
   let response: Response;
   try {
     response = await fetch(url, {
       headers: { Accept: "application/json" },
-      cache: "no-store",
-      signal: AbortSignal.timeout(12_000),
+      next: { revalidate: CACHE_SECONDS },
     });
   } catch {
     throw new MetalsError("Could not reach Metals.Dev. Check your connection and try again.");
@@ -97,140 +106,113 @@ async function metalsGet(path: string, params: Record<string, string>) {
 
   const record = body as Record<string, unknown>;
   if (!response.ok || record.status === "failure") {
-    const message = readString(record.error_message) ?? "Metals.Dev rejected the request.";
-    throw new MetalsError(message);
+    throw new MetalsError(readString(record.error_message) ?? "Metals.Dev rejected the request.");
   }
 
-  return record;
-}
-
-function parseSpot(record: Record<string, unknown>, metal: "gold" | "silver"): Quote {
-  const rate = record.rate;
-  if (!rate || typeof rate !== "object") {
-    throw new MetalsError(`Spot prices for ${metal} were missing from the response.`);
+  const metals = record.metals;
+  if (!metals || typeof metals !== "object") {
+    throw new MetalsError("Metal prices were missing from the response.");
   }
 
-  const values = rate as Record<string, unknown>;
-  const price = readNumber(values.price);
-  const ask = readNumber(values.ask);
-  const bid = readNumber(values.bid);
-  const high = readNumber(values.high);
-  const low = readNumber(values.low);
-  const change = readNumber(values.change);
-  const changePercent = readNumber(values.change_percent);
-  const asOf = readString(record.timestamp);
+  const prices = metals as Record<string, unknown>;
+  const spotGold = readNumber(prices.gold);
+  const spotSilver = readNumber(prices.silver);
+  const mcxGold = readNumber(prices.mcx_gold);
+  const mcxSilver = readNumber(prices.mcx_silver);
+  const ibjaGold = readNumber(prices.ibja_gold);
 
-  if (
-    price === null ||
-    ask === null ||
-    bid === null ||
-    high === null ||
-    low === null ||
-    change === null ||
-    changePercent === null ||
-    !asOf
-  ) {
-    throw new MetalsError(`Spot prices for ${metal} were incomplete.`);
+  if (spotGold === null && mcxGold === null) {
+    throw new MetalsError("Gold prices were missing from the response.");
   }
 
-  return {
-    metal,
-    price,
-    ask,
-    bid,
-    high,
-    low,
-    change,
-    changePercent,
-    asOf,
-    history: [],
-  };
-}
+  const timestamps = record.timestamps;
+  const marketTime =
+    (timestamps && typeof timestamps === "object"
+      ? readString((timestamps as Record<string, unknown>).metal)
+      : null) ?? new Date().toISOString();
 
-function parseHistory(record: Record<string, unknown>, metal: "gold" | "silver") {
-  const rates = record.rates;
-  if (!rates || typeof rates !== "object") return [];
-
-  const points: HistoryPoint[] = [];
-  for (const [key, value] of Object.entries(rates)) {
-    if (!value || typeof value !== "object") continue;
-    const day = value as Record<string, unknown>;
-    const metals = day.metals;
-    if (!metals || typeof metals !== "object") continue;
-    const price = readNumber((metals as Record<string, unknown>)[metal]);
-    if (price === null) continue;
-    points.push({ date: readString(day.date) ?? key, price });
-  }
-
-  return points.sort((a, b) => a.date.localeCompare(b.date));
-}
-
-async function loadHistory() {
-  if (historyCache && historyCache.expires > Date.now()) {
-    return historyCache;
-  }
-
-  const end = new Date();
-  const start = new Date(end);
-  start.setUTCDate(start.getUTCDate() - 13);
-
-  try {
-    const record = await metalsGet("/timeseries", {
-      start_date: isoDate(start),
-      end_date: isoDate(end),
+  const realGold: RealRate[] = [];
+  if (spotGold !== null) {
+    realGold.push({
+      code: "gold",
+      name: "Spot gold",
+      pricePerGram: spotGold,
+      detail: "International fine gold",
     });
-    const next = {
-      expires: Date.now() + CACHE_MS,
-      gold: parseHistory(record, "gold"),
-      silver: parseHistory(record, "silver"),
-    };
-    historyCache = next;
-    return next;
-  } catch {
-    return { expires: 0, gold: [], silver: [] };
   }
-}
+  if (mcxGold !== null) {
+    realGold.push({
+      code: "mcx_gold",
+      name: "MCX gold",
+      pricePerGram: mcxGold,
+      detail: "Indian exchange, 995 fine",
+    });
+  }
+  if (ibjaGold !== null) {
+    realGold.push({
+      code: "ibja_gold",
+      name: "IBJA gold",
+      pricePerGram: ibjaGold,
+      detail: "Published association rate",
+    });
+  }
 
-async function loadRates(currency: CurrencyCode): Promise<RatesData> {
-  const [goldRecord, silverRecord, history] = await Promise.all([
-    metalsGet("/metal/spot", { metal: "gold", currency }),
-    metalsGet("/metal/spot", { metal: "silver", currency }),
-    loadHistory(),
-  ]);
+  const realSilver: RealRate[] = [];
+  if (spotSilver !== null) {
+    realSilver.push({
+      code: "silver",
+      name: "Spot silver",
+      pricePerGram: spotSilver,
+      detail: "International spot",
+    });
+  }
+  if (mcxSilver !== null) {
+    realSilver.push({
+      code: "mcx_silver",
+      name: "MCX silver",
+      pricePerGram: mcxSilver,
+      detail: "Indian exchange, 999 fine",
+    });
+  }
 
-  const gold = parseSpot(goldRecord, "gold");
-  const silver = parseSpot(silverRecord, "silver");
-  gold.history = history.gold;
-  silver.history = history.silver;
+  const base = mcxGold !== null ? "mcx" : "spot";
+  const basePrice = mcxGold ?? spotGold;
+  if (basePrice === null) {
+    throw new MetalsError("Gold prices were missing from the response.");
+  }
 
   return {
-    currency,
-    unit: "toz",
+    currency: "INR",
+    unit: "g",
     fetchedAt: new Date().toISOString(),
-    quotes: [gold, silver],
+    marketTime,
+    cacheSeconds: CACHE_SECONDS,
+    base,
+    baseLabel: base === "mcx" ? "MCX gold (995 fine)" : "Spot gold (999 fine)",
+    realGold,
+    realSilver,
+    categories: categoriesFrom(basePrice, base === "mcx" ? MCX_FINENESS : FINE_GOLD),
   };
 }
 
-export async function getRates(
-  currencyInput: string,
-  options: { fresh?: boolean } = {},
-): Promise<RatesResult> {
-  await connection();
-  const currency = currencyInput.toUpperCase();
-  if (!isCurrency(currency)) {
-    return { ok: false, error: "That currency is not supported.", missingKey: false };
-  }
+const loadCachedLatest = unstable_cache(fetchLatest, ["metals-latest-inr-gram"], {
+  revalidate: CACHE_SECONDS,
+});
 
-  const cached = quoteCache.get(currency);
-  if (!options.fresh && cached && cached.expires > Date.now()) {
-    return { ok: true, data: cached.data };
+export async function getRates(): Promise<RatesResult> {
+  await connection();
+
+  if (memory && memory.expires > Date.now()) {
+    return { ok: true, data: memory.data };
   }
 
   try {
-    const data = await loadRates(currency);
-    quoteCache.set(currency, { expires: Date.now() + CACHE_MS, data });
+    const data = await loadCachedLatest();
+    memory = { expires: Date.now() + CACHE_SECONDS * 1000, data };
     return { ok: true, data };
   } catch (error) {
+    if (memory) return { ok: true, data: memory.data };
+
     if (error instanceof MetalsError && error.message === "MISSING_KEY") {
       return {
         ok: false,
