@@ -14,7 +14,7 @@ const fraunces = Fraunces({
 
 export const metadata: Metadata = {
   title: "Gold & Silver — Live rates",
-  description: "Live gold and silver spot prices, with bid, ask, and the day’s range.",
+  description: "Live MCX gold and silver futures from Angel One SmartAPI.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

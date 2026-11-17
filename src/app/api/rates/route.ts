@@ -1,4 +1,4 @@
-import { getRates } from "@/lib/metals";
+import { getRates } from "@/lib/angel";
 
 export async function GET() {
   const result = await getRates();
@@ -12,7 +12,7 @@ export async function GET() {
 
   return Response.json(result.data, {
     headers: {
-      "Cache-Control": `private, max-age=${result.data.cacheSeconds}`,
+      "Cache-Control": "private, no-store",
     },
   });
 }

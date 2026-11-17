@@ -1,6 +1,6 @@
 "use client";
 
-import type { GoldCategory, RatesData, RatesResult, RealRate } from "@/lib/metals";
+import type { GoldCategory, LiveQuote, RatesData, RatesResult } from "@/lib/angel";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 const LOCALE = "en-IN";
@@ -20,21 +20,26 @@ function formatClock(iso: string) {
   return new Intl.DateTimeFormat(LOCALE, {
     hour: "numeric",
     minute: "2-digit",
+    second: "2-digit",
     timeZone: "Asia/Kolkata",
     timeZoneName: "short",
   }).format(date);
 }
 
+function formatSigned(value: number, digits = 2) {
+  const formatted = new Intl.NumberFormat(LOCALE, {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  }).format(Math.abs(value));
+  if (value > 0) return `+${formatted}`;
+  if (value < 0) return `−${formatted}`;
+  return formatted;
+}
+
 function isRatesData(value: unknown): value is RatesData {
   if (!value || typeof value !== "object") return false;
   const record = value as Record<string, unknown>;
-  return (
-    record.currency === "INR" &&
-    typeof record.fetchedAt === "string" &&
-    typeof record.baseLabel === "string" &&
-    Array.isArray(record.realGold) &&
-    Array.isArray(record.categories)
-  );
+  return record.source === "angelone" && Array.isArray(record.quotes) && Array.isArray(record.categories);
 }
 
 export function RatesBoard({ initial }: { initial: RatesResult }) {
@@ -42,11 +47,14 @@ export function RatesBoard({ initial }: { initial: RatesResult }) {
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const hasRates = useRef(initial.ok);
+  const loadingRef = useRef(false);
 
   const load = useCallback(async () => {
+    if (loadingRef.current) return;
+    loadingRef.current = true;
     setLoading(true);
     try {
-      const response = await fetch("/api/rates");
+      const response = await fetch("/api/rates", { cache: "no-store" });
       const body: unknown = await response.json();
       if (!response.ok || !isRatesData(body)) {
         const record = body && typeof body === "object" ? (body as Record<string, unknown>) : {};
@@ -67,18 +75,19 @@ export function RatesBoard({ initial }: { initial: RatesResult }) {
       setResult({ ok: true, data: body });
     } catch {
       if (hasRates.current) {
-        setNotice("Could not reach the rates service. Showing the saved prices.");
+        setNotice("Could not reach the rates service. Showing the last prices.");
         return;
       }
       setResult({ ok: false, error: "Could not reach the rates service.", missingKey: false });
     } finally {
+      loadingRef.current = false;
       setLoading(false);
     }
   }, []);
 
   useEffect(() => {
     if (!result.ok && result.missingKey) return;
-    const wait = result.ok ? result.data.cacheSeconds * 1000 : 600_000;
+    const wait = result.ok ? result.data.refreshSeconds * 1000 : 15_000;
     const timer = window.setInterval(() => {
       if (document.hidden) return;
       void load();
@@ -104,18 +113,14 @@ export function RatesBoard({ initial }: { initial: RatesResult }) {
             <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-gold opacity-70" />
             <span className="relative inline-flex h-2 w-2 rounded-full bg-gold" />
           </span>
-          Live Indian rates
+          Live MCX via Angel One
         </p>
-        <h1 className="mt-3 font-serif text-5xl tracking-tight text-paper sm:text-6xl">
-          Gold & Silver
-        </h1>
+        <h1 className="mt-3 font-serif text-5xl tracking-tight text-paper sm:text-6xl">Gold & Silver</h1>
         {today ? <p className="mt-2 text-sm text-paper/60">{today}</p> : null}
       </header>
 
       {notice ? (
-        <p className="mt-6 rounded-2xl border border-down/40 bg-panel px-4 py-3 text-sm text-down">
-          {notice}
-        </p>
+        <p className="mt-6 rounded-2xl border border-down/40 bg-panel px-4 py-3 text-sm text-down">{notice}</p>
       ) : null}
 
       {result.ok ? (
@@ -141,9 +146,9 @@ function Board({
       <div className="mt-6 flex flex-wrap items-center justify-between gap-3 text-sm text-paper/60">
         <p aria-live="polite">
           {loading
-            ? "Checking saved prices…"
-            : `Saved from Metals.Dev · refreshes every ${Math.round(data.cacheSeconds / 60)} minutes`}
-          {` · Market ${formatClock(data.marketTime)}`}
+            ? "Checking Angel One…"
+            : `Angel One SmartAPI · refreshes every ${data.refreshSeconds} seconds`}
+          {` · Feed ${formatClock(data.marketTime)}`}
         </p>
         <button
           type="button"
@@ -156,51 +161,81 @@ function Board({
       </div>
 
       <section className="mt-8">
-        <h2 className="font-serif text-3xl text-paper">Published rates</h2>
-        <p className="mt-1 text-sm text-paper/50">Prices returned by Metals.Dev, in rupees.</p>
-        <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {data.realGold.map((rate) => (
-            <RateCard key={rate.code} rate={rate} quantityLabel="per 10 grams" multiplier={10} />
-          ))}
-          {data.realSilver.map((rate) => (
-            <RateCard key={rate.code} rate={rate} quantityLabel="per kg" multiplier={1000} />
+        <h2 className="font-serif text-3xl text-paper">MCX futures</h2>
+        <p className="mt-1 text-sm text-paper/50">Front-month contracts. Gold is quoted per 10 grams, silver per kg.</p>
+        <div className="mt-4 grid gap-4 sm:grid-cols-2">
+          {data.quotes.map((quote) => (
+            <QuoteCard key={quote.code} quote={quote} />
           ))}
         </div>
       </section>
 
-      <section className="mt-10">
-        <h2 className="font-serif text-3xl text-paper">Gold categories</h2>
-        <p className="mt-1 max-w-2xl text-sm leading-6 text-paper/50">
-          Calculated from {data.baseLabel}. 24K is 999 fine, 22K is 916, 18K is 750, and 14K is 585.
-        </p>
-        <div className="mt-4 grid gap-4 sm:grid-cols-2">
-          {data.categories.map((category) => (
-            <CategoryCard key={category.karat} category={category} />
-          ))}
-        </div>
-      </section>
+      {data.categories.length > 0 ? (
+        <section className="mt-10">
+          <h2 className="font-serif text-3xl text-paper">Gold categories</h2>
+          <p className="mt-1 max-w-2xl text-sm leading-6 text-paper/50">
+            Metal value scaled from {data.baseLabel}, which is 995 fine. 24K is 999, 22K is 916, 18K is 750,
+            and 14K is 585. This is the gold value only, before making charges.
+          </p>
+          <div className="mt-4 grid gap-4 sm:grid-cols-2">
+            {data.categories.map((category) => (
+              <CategoryCard key={category.karat} category={category} />
+            ))}
+          </div>
+        </section>
+      ) : null}
     </>
   );
 }
 
-function RateCard({
-  rate,
-  quantityLabel,
-  multiplier,
-}: {
-  rate: RealRate;
-  quantityLabel: string;
-  multiplier: number;
-}) {
+function QuoteCard({ quote }: { quote: LiveQuote }) {
+  const rising = quote.change > 0;
+  const falling = quote.change < 0;
+  const tone = rising ? "text-up" : falling ? "text-down" : "text-paper/60";
+  const accent = quote.metal === "gold" ? "border-gold/30" : "border-silver/30";
+
   return (
-    <article className="rounded-3xl border border-line bg-panel p-6">
-      <h3 className="font-serif text-2xl text-paper">{rate.name}</h3>
-      <p className="mt-1 text-sm text-paper/50">{rate.detail}</p>
-      <p className="mt-6 font-serif text-4xl tracking-tight text-paper tabular-nums">
-        {formatInr(rate.pricePerGram * multiplier)}
+    <article className={`rounded-3xl border bg-panel p-6 ${accent}`}>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className={`font-serif text-2xl ${quote.metal === "gold" ? "text-gold" : "text-silver"}`}>
+            {quote.name}
+          </h3>
+          <p className="mt-1 text-sm text-paper/50">{quote.detail}</p>
+        </div>
+        <p className={`text-right text-sm font-medium tabular-nums ${tone}`}>
+          {formatSigned(quote.change)}
+          <span className="mt-0.5 block">{formatSigned(quote.changePercent)}%</span>
+        </p>
+      </div>
+      <p className="mt-6 font-serif text-4xl tracking-tight text-paper tabular-nums sm:text-5xl">
+        {formatInr(quote.ltp)}
       </p>
-      <p className="mt-2 text-sm text-paper/50">{quantityLabel}</p>
+      <p className="mt-2 text-sm text-paper/50">
+        {quote.unitLabel}
+        {quote.metal === "gold" ? ` · ${formatInr(quote.ltp / 10)} per gram` : null}
+      </p>
+      <p className="mt-1 text-xs tracking-wide text-paper/40 uppercase">
+        {quote.symbol} · expires {quote.expiryLabel}
+      </p>
+      <dl className="mt-5 grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
+        <Stat label="Open" value={quote.open} />
+        <Stat label="High" value={quote.high} />
+        <Stat label="Low" value={quote.low} />
+        <Stat label="Prev" value={quote.close} />
+        {quote.bid !== null ? <Stat label="Bid" value={quote.bid} /> : null}
+        {quote.ask !== null ? <Stat label="Ask" value={quote.ask} /> : null}
+      </dl>
     </article>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: number }) {
+  return (
+    <div>
+      <dt className="text-xs tracking-wide text-paper/40 uppercase">{label}</dt>
+      <dd className="mt-1 text-paper tabular-nums">{formatInr(value)}</dd>
+    </div>
   );
 }
 
@@ -224,10 +259,15 @@ function CategoryCard({ category }: { category: GoldCategory }) {
 function SetupPanel({ message, missingKey }: { message: string; missingKey: boolean }) {
   return (
     <section className="mt-8 max-w-xl rounded-3xl border border-gold/30 bg-panel p-6 sm:p-8">
-      <h2 className="font-serif text-3xl text-paper">
-        {missingKey ? "Connect Metals.Dev" : "Rates unavailable"}
-      </h2>
+      <h2 className="font-serif text-3xl text-paper">{missingKey ? "Connect Angel One" : "Rates unavailable"}</h2>
       <p className="mt-3 text-sm leading-6 text-paper/70">{message}</p>
+      {missingKey ? (
+        <ol className="mt-5 list-decimal space-y-2 pl-5 text-sm leading-6 text-paper/70">
+          <li>Create an app at smartapi.angelone.in and copy its API key.</li>
+          <li>Use your Angel One client code and trading PIN.</li>
+          <li>Put the authenticator setup key in ANGEL_TOTP_SECRET, not the 6-digit code.</li>
+        </ol>
+      ) : null}
     </section>
   );
 }
